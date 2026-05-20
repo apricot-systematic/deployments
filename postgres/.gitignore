@@ -1,0 +1,14 @@
+# Runtime secrets — never commit
+.env
+
+# SSL certificates and keys — never commit private keys.
+# The CA cert (ca.crt) may be committed for dev environments if all developers
+# need it to verify the server, but is excluded here by default.
+certs/*.crt
+certs/*.key
+certs/*.pem
+certs/*.csr
+certs/*.srl
+
+# Backup output
+backups/
