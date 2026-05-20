@@ -21,10 +21,12 @@ services:
       - ./init:/docker-entrypoint-initdb.d:ro
       - ./docker/entrypoint.sh:/docker-entrypoint-wrapper.sh:ro
     ports:
-      # Exposes the port on the host for external (non-Docker) clients.
-      # Default binds to 127.0.0.1 (loopback only).
-      # Set POSTGRES_BIND to the host's public IP (or 0.0.0.0) for external SSL access.
+      # IPv4 — defaults to loopback only.  Set POSTGRES_BIND to a public IP
+      # (or 0.0.0.0) for external SSL access.
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+      # IPv6 — defaults to loopback only.  Set POSTGRES_BIND6=:: to listen on
+      # all IPv6 interfaces (e.g. for Tailscale fd7a:115c:a1e0::/48 access).
+      - "[${POSTGRES_BIND6:-::1}]:${POSTGRES_PORT:-5432}:5432"
     networks:
       - postgres_net
     healthcheck:

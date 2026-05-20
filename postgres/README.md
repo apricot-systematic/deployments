@@ -173,16 +173,16 @@ Then restart: `docker compose restart`
 
 PostgreSQL listens on all interfaces (`listen_addresses = '*'`), but **`pg_hba.conf` enforces SSL selectively by source address**.  Docker-internal services connect without SSL; external connections require SSL and must come from a declared network.  Both work simultaneously with no conflict.
 
-At container startup, `docker/entrypoint.sh` inspects the container's own network interfaces and generates two `pg_hba.conf` include files in `/tmp/`:
+At container startup, `docker/entrypoint.sh` reads the kernel routing table and generates two `pg_hba.conf` include files in `/tmp/`:
 
 | File | Generated from | Rule type |
 |------|----------------|-----------|
-| `pg_hba_docker.conf` | container's network interfaces (automatic) | `host` — no SSL required |
+| `pg_hba_docker.conf` | kernel routing table — automatic, IPv4 + IPv6 | `host` — no SSL required |
 | `pg_hba_external.conf` | `POSTGRES_ALLOWED_NETWORKS` in `.env` | `hostssl` — SSL required |
 
 ### Docker services on the same host (shared network)
 
-No configuration needed beyond joining the network.  The `postgres_net` network is **created by this compose file** — no manual `docker network create` required.  At startup the entrypoint detects the subnet Docker assigned and writes a `host` rule for it automatically.
+No configuration needed beyond joining the network.  The `postgres_net` network is **created by this compose file** — no manual `docker network create` required.  At startup the entrypoint reads the directly-attached kernel routes (both IPv4 and IPv6) and writes a `host` rule for each, so any Docker service sharing a network with this container can connect without SSL.
 
 In the application stack's `docker-compose.yml`:
 
@@ -204,43 +204,57 @@ The network name defaults to `postgres_net`.  If you changed `POSTGRES_NETWORK` 
 
 > **Note:** `docker compose down` will attempt to remove `postgres_net`.  If application containers are still attached it will warn and leave the network in place — a useful signal not to tear down Postgres while apps are running.
 
-### External clients (non-Docker)
+### External clients (non-Docker) — IPv4 and IPv6
 
-Two settings work together for external access.  **Do not list Docker subnets in `POSTGRES_ALLOWED_NETWORKS`** — those are handled automatically.
+Three settings work together.  **Do not list Docker subnets in `POSTGRES_ALLOWED_NETWORKS`** — those are handled automatically.
 
-**1. Which interface to expose** — set `POSTGRES_BIND` in `.env`:
-
-```bash
-# Bind to a specific public IP (recommended):
-POSTGRES_BIND=203.0.113.10
-
-# Or all interfaces (acceptable behind a firewall):
-POSTGRES_BIND=0.0.0.0
-```
-
-**2. Which external networks are trusted** — set `POSTGRES_ALLOWED_NETWORKS` in `.env`:
+**1. Which interfaces to expose:**
 
 ```bash
-# Single trusted host:
-POSTGRES_ALLOWED_NETWORKS=203.0.113.42/32
+# IPv4 — specific public IP (recommended) or 0.0.0.0 for all interfaces:
+POSTGRES_BIND=10.0.1.10
 
-# Office + VPN ranges:
-POSTGRES_ALLOWED_NETWORKS=203.0.113.0/24,198.51.100.128/25
+# IPv6 — :: listens on all IPv6 interfaces (Tailscale, LAN, etc.):
+POSTGRES_BIND6=::
 ```
 
-At startup the entrypoint generates `hostssl` rules from this list.  A connection from an IP not in the list matches no rule and is rejected.  If the variable is empty or unset, the file is not created and all external connections are blocked — the safe default.
+**2. Which external networks are trusted** (`POSTGRES_ALLOWED_NETWORKS`):
+
+Both IPv4 and IPv6 CIDRs are accepted in the same comma-separated list:
+
+```bash
+POSTGRES_ALLOWED_NETWORKS=10.0.1.0/24,100.64.0.0/10,fd7a:115c:a1e0::/48
+```
+
+At startup the entrypoint writes one `hostssl` rule per CIDR.  A connection whose source address does not match any rule is rejected — no rule, no access.
 
 To update the allowlist: edit `POSTGRES_ALLOWED_NETWORKS` in `.env` and run `docker compose restart`.
 
 > SSL must be configured in `config/postgresql.conf` for `hostssl` rules to take effect.
 
+#### Tailscale
+
+Tailscale assigns each node both an IPv4 address (`100.64.0.0/10`) and an IPv6 address (`fd7a:115c:a1e0::/48`).  Include both if you want clients to be able to use either.  Set `POSTGRES_BIND6=::` so the container's IPv6 port binding covers the Tailscale interface on the host.
+
+Tailscale's WireGuard layer already encrypts all traffic, so the PostgreSQL SSL layer is redundant protection — but it keeps the auth model consistent and costs nothing in practice.
+
+#### Inspecting the generated rules
+
+After starting the container, confirm what was generated:
+
+```bash
+docker compose exec postgres cat /tmp/pg_hba_docker.conf
+docker compose exec postgres cat /tmp/pg_hba_external.conf
+```
+
 ### Summary
 
 | Client | Path | SSL enforced |
 |--------|------|-------------|
-| Docker service on `postgres_net` | `postgres:5432` | No — subnet auto-detected, `host` rule |
-| External host in `POSTGRES_ALLOWED_NETWORKS` | `<host-ip>:5432` | Yes — `hostssl` rule |
-| External host **not** in allowlist | `<host-ip>:5432` | Rejected — no matching rule |
+| Docker service on `postgres_net` | `postgres:5432` (service name) | No — subnet auto-detected |
+| External IPv4 host in allowlist | `<host-ip>:5432` | Yes — `hostssl` rule |
+| External IPv6 host in allowlist | `[<host-ipv6>]:5432` | Yes — `hostssl` rule |
+| Any host **not** in allowlist | either port | Rejected — no matching rule |
 
 ## HashiCorp Vault integration
 
