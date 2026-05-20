@@ -16,9 +16,12 @@ services:
       - ./certs:/etc/postgresql/certs
       - ./init:/docker-entrypoint-initdb.d:ro
     ports:
-      # Bind to 127.0.0.1 by default so the port is not exposed publicly.
-      # Set POSTGRES_BIND=0.0.0.0 in .env when external access is needed.
+      # Exposes the port on the host for external (non-Docker) clients.
+      # Default binds to 127.0.0.1 (loopback only).
+      # Set POSTGRES_BIND to the host's public IP (or 0.0.0.0) for external SSL access.
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - postgres_net
     command: postgres -c config_file=/etc/postgresql/postgresql.conf
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
@@ -26,6 +29,16 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+networks:
+  postgres_net:
+    # Explicit name so other stacks can reference this network as external without
+    # knowing the compose project name.  Other stacks join it with:
+    #   networks:
+    #     postgres_net:
+    #       external: true
+    name: ${POSTGRES_NETWORK:-postgres_net}
+    driver: bridge
 
 volumes:
   postgres_data:

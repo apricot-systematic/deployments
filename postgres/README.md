@@ -111,97 +111,121 @@ Run `backup.sh` from cron or a systemd timer on the Docker host.  Rotate old bac
 
 ## SSL / TLS
 
-SSL is disabled by default.  To enable it:
+SSL is disabled by default.  Cert filenames follow the **certbot / Let's Encrypt convention** (`fullchain.pem`, `privkey.pem`) so the same config works for both dev self-signed certs and production Let's Encrypt certs.  A separate CA file is not needed — `fullchain.pem` includes the full chain and clients verify against their trusted public CA roots.
 
 ### Development (self-signed certificates)
 
 ```bash
 ./scripts/generate-dev-certs.sh
-# Set key ownership so PostgreSQL (UID 999) can read it:
-sudo chown 999:999 certs/server.key
+chmod 600 certs/privkey.pem
+# Linux only — Docker Desktop manages file ownership through a VM:
+sudo chown 999:999 certs/privkey.pem
 ```
 
-### Production (real certificates)
+The script produces `fullchain.pem` (cert + dev CA chain) and `privkey.pem`, plus `ca.crt` which dev clients need to verify the self-signed server cert.
 
-Place your certificates in `certs/`:
+### Production (certbot / Let's Encrypt)
 
-| File         | Contents                                |
-|--------------|-----------------------------------------|
-| `server.crt` | Server certificate (+ intermediate chain if needed) |
-| `server.key` | Server private key                      |
-| `ca.crt`     | CA certificate (optional, for client cert auth) |
-
-Set permissions:
+Certbot writes live certificates to `/etc/letsencrypt/live/<domain>/`.  Symlink or copy them into `certs/`:
 
 ```bash
-chmod 600 certs/server.key
-chmod 644 certs/server.crt certs/ca.crt
-# Linux hosts: set ownership so the postgres process (UID 999) can read the key.
-sudo chown 999:999 certs/server.key
-# macOS / Docker Desktop: ownership of bind-mounted files is managed by the VM —
-# chmod 600 is usually sufficient; chown to 999 may have no effect.
+# As root on the host — copy so Docker can read without running as root:
+install -m 644 /etc/letsencrypt/live/db.example.com/fullchain.pem certs/fullchain.pem
+install -m 600 /etc/letsencrypt/live/db.example.com/privkey.pem   certs/privkey.pem
+# Linux: the postgres process (UID 999) must own the key:
+chown 999:999 certs/privkey.pem
 ```
 
-Then in `config/postgresql.conf`, uncomment the SSL block:
+Add a deploy hook so certbot refreshes the copies on renewal:
+
+```bash
+# /etc/letsencrypt/renewal-hooks/deploy/postgres-certs.sh
+#!/bin/bash
+install -m 644 /etc/letsencrypt/live/db.example.com/fullchain.pem \
+    /path/to/postgres/certs/fullchain.pem
+install -m 600 /etc/letsencrypt/live/db.example.com/privkey.pem \
+    /path/to/postgres/certs/privkey.pem
+chown 999:999 /path/to/postgres/certs/privkey.pem
+docker compose -f /path/to/postgres/docker-compose.yml restart
+```
+
+### Enabling SSL in config
+
+In `config/postgresql.conf`, uncomment:
 
 ```
 ssl          = on
-ssl_cert_file = '/etc/postgresql/certs/server.crt'
-ssl_key_file  = '/etc/postgresql/certs/server.key'
-ssl_ca_file   = '/etc/postgresql/certs/ca.crt'
+ssl_cert_file = '/etc/postgresql/certs/fullchain.pem'
+ssl_key_file  = '/etc/postgresql/certs/privkey.pem'
 ```
 
-And in `config/pg_hba.conf`, replace the remote `host` rule with `hostssl`:
+In `config/pg_hba.conf`, uncomment the `hostssl` line:
 
 ```
 hostssl all  all  0.0.0.0/0  scram-sha-256
 ```
 
-Restart the container: `docker compose restart`
+Then restart: `docker compose restart`
 
-## Connecting other Docker Compose stacks
+## Connecting other services — Docker vs. external
 
-### Option 1 — exposed host port (different hosts or simple setups)
+PostgreSQL listens on all interfaces (`listen_addresses = '*'`), but **authentication rules in `pg_hba.conf` enforce SSL selectively by source address**.  This lets Docker-internal services connect without SSL while requiring SSL for any connection arriving from outside the Docker network.
 
-Set `POSTGRES_BIND=0.0.0.0` (or a specific interface) in `.env`.  Other services connect using the Docker host's IP and `POSTGRES_PORT`.
+```
+# pg_hba.conf evaluation order (first match wins):
+host     ...  172.16.0.0/12  scram-sha-256   ← Docker bridge, no SSL required
+host     ...  10.0.0.0/8     scram-sha-256   ← Docker bridge, no SSL required
+hostssl  ...  0.0.0.0/0      scram-sha-256   ← everything else, SSL required
+```
 
-### Option 2 — shared Docker network (same host, cross-stack)
+`hostssl` only matches connections that are actually using SSL — a non-SSL connection from outside the Docker subnets will not match any rule and will be rejected.
 
-Add an external network to this compose file:
+### Docker services on the same host (shared network)
+
+This is the recommended path for same-host stacks.  The `postgres_net` network is **defined and created by this compose file** — no manual `docker network create` needed.  Other stacks join it as an external network and reach Postgres by the service name `postgres` without SSL.
+
+In the application stack's `docker-compose.yml`:
 
 ```yaml
 networks:
-  shared_db:
-    external: true
-
-services:
-  postgres:
-    networks:
-      - shared_db
-```
-
-Create it once:
-
-```bash
-docker network create shared_db
-```
-
-In the application's `docker-compose.yml`:
-
-```yaml
-networks:
-  shared_db:
-    external: true
+  postgres_net:
+    external: true      # created by the postgres stack, not by this file
 
 services:
   app:
     networks:
-      - shared_db
+      - postgres_net
     environment:
+      # Connect by service name — no SSL needed over the Docker bridge
       DATABASE_URL: postgresql://myapp_role:password@postgres:5432/myapp
 ```
 
-Using a shared network avoids exposing the port on the host and lets containers reach Postgres by service name (`postgres`).
+The network name defaults to `postgres_net`.  If you changed `POSTGRES_NETWORK` in `.env`, use that name here instead.
+
+> **Note:** `docker compose down` will attempt to remove `postgres_net`.  If application containers are still attached it will warn and leave the network in place — a useful reminder not to tear down Postgres while apps are running.
+
+### External clients (non-Docker)
+
+The port binding in `docker-compose.yml` handles this independently of the Docker network.  Set `POSTGRES_BIND` in `.env` to the host interface to expose:
+
+```bash
+# Expose on a specific public IP (recommended — avoids exposing on all interfaces):
+POSTGRES_BIND=203.0.113.10
+
+# Or all interfaces:
+POSTGRES_BIND=0.0.0.0
+```
+
+External connections arrive at the host's public IP, don't match the Docker subnet rules in `pg_hba.conf`, and are caught by the `hostssl` rule — SSL is required.  Ensure your firewall permits `POSTGRES_PORT` on that interface.
+
+### Both at the same time
+
+The two mechanisms are independent and work simultaneously:
+
+| Client | Path | SSL |
+|--------|------|-----|
+| Docker container on `postgres_net` | `postgres:5432` (service name) | not required — matched by subnet rule |
+| External host / Vault / admin tool | `<host-ip>:5432` (exposed port) | required — matched by `hostssl` rule |
 
 ## HashiCorp Vault integration
 
@@ -284,11 +308,12 @@ For environment-specific tuning (memory, connections, WAL settings) add the para
 ## Production checklist
 
 - [ ] Set a strong `POSTGRES_PASSWORD` and store it in a secrets manager
-- [ ] Enable SSL and provide real certificates from a CA
-- [ ] Bind to a specific interface (`POSTGRES_BIND`), not `0.0.0.0` unless necessary
+- [ ] Enable SSL: deploy certbot certs (`fullchain.pem`, `privkey.pem`) and uncomment ssl lines in `postgresql.conf` and `pg_hba.conf`
+- [ ] Add a certbot deploy hook to refresh `certs/` and restart the container on renewal
+- [ ] Use a shared Docker network for same-host app access (no port exposure needed)
+- [ ] For external access, set `POSTGRES_BIND` to a specific IP, not `0.0.0.0`
+- [ ] Tighten the Docker subnet ranges in `pg_hba.conf` to match your actual network
 - [ ] Schedule regular backups and verify restore works
-- [ ] Set `POSTGRES_BIND=127.0.0.1` and use a shared Docker network for app access
-- [ ] Lock `pg_hba.conf` to the minimum required address ranges
-- [ ] Review and tune `postgresql.conf` for your workload
+- [ ] Review and tune `postgresql.conf` for your workload (connections, memory)
 - [ ] Set up log shipping or a log aggregator (the container writes to stderr)
 - [ ] If using Vault, rotate the `vault_manager` password after initial setup
