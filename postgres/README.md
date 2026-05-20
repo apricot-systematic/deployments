@@ -14,6 +14,8 @@ postgres/
 │   └── pg_ident.conf           # username maps (usually empty)
 ├── certs/                      # SSL certificates (not committed)
 │   └── .gitkeep
+├── docker/
+│   └── entrypoint.sh           # container entrypoint: generates pg_hba allowlist from env
 ├── init/
 │   └── 01-bootstrap.sql        # runs once on first container init
 ├── scripts/
@@ -206,26 +208,43 @@ The network name defaults to `postgres_net`.  If you changed `POSTGRES_NETWORK` 
 
 ### External clients (non-Docker)
 
-The port binding in `docker-compose.yml` handles this independently of the Docker network.  Set `POSTGRES_BIND` in `.env` to the host interface to expose:
+External access is controlled by two independent settings that work together:
+
+**1. Which interface to expose** — set `POSTGRES_BIND` in `.env`:
 
 ```bash
-# Expose on a specific public IP (recommended — avoids exposing on all interfaces):
+# Specific public IP (recommended):
 POSTGRES_BIND=203.0.113.10
 
-# Or all interfaces:
+# All interfaces (less precise, but acceptable behind a firewall):
 POSTGRES_BIND=0.0.0.0
 ```
 
-External connections arrive at the host's public IP, don't match the Docker subnet rules in `pg_hba.conf`, and are caught by the `hostssl` rule — SSL is required.  Ensure your firewall permits `POSTGRES_PORT` on that interface.
+**2. Which source networks are allowed** — set `POSTGRES_ALLOWED_NETWORKS` in `.env`:
+
+```bash
+# Single trusted host:
+POSTGRES_ALLOWED_NETWORKS=203.0.113.42/32
+
+# Office + VPN:
+POSTGRES_ALLOWED_NETWORKS=203.0.113.0/24,198.51.100.128/25
+```
+
+At container startup, `docker/entrypoint.sh` reads `POSTGRES_ALLOWED_NETWORKS` and generates `hostssl` rules in `/tmp/pg_hba_external.conf`, which `pg_hba.conf` pulls in via `@include_if_exists`.  If the variable is empty or unset, no external connections are permitted — the safe default.
+
+To update the allowlist: edit `POSTGRES_ALLOWED_NETWORKS` in `.env` and run `docker compose restart`.
+
+> SSL must also be configured in `config/postgresql.conf` for `hostssl` rules to take effect.
 
 ### Both at the same time
 
-The two mechanisms are independent and work simultaneously:
+The two mechanisms are fully independent and work simultaneously with no conflict:
 
 | Client | Path | SSL |
 |--------|------|-----|
-| Docker container on `postgres_net` | `postgres:5432` (service name) | not required — matched by subnet rule |
-| External host / Vault / admin tool | `<host-ip>:5432` (exposed port) | required — matched by `hostssl` rule |
+| Docker container on `postgres_net` | `postgres:5432` (service name) | not required — matched by subnet rule in `pg_hba.conf` |
+| External host / Vault / admin tool | `<host-ip>:5432` (exposed port) | required — matched by generated `hostssl` rule; source must be in `POSTGRES_ALLOWED_NETWORKS` |
+| External host not in allowlist | `<host-ip>:5432` | rejected — no matching rule |
 
 ## HashiCorp Vault integration
 
@@ -311,7 +330,7 @@ For environment-specific tuning (memory, connections, WAL settings) add the para
 - [ ] Enable SSL: deploy certbot certs (`fullchain.pem`, `privkey.pem`) and uncomment ssl lines in `postgresql.conf` and `pg_hba.conf`
 - [ ] Add a certbot deploy hook to refresh `certs/` and restart the container on renewal
 - [ ] Use a shared Docker network for same-host app access (no port exposure needed)
-- [ ] For external access, set `POSTGRES_BIND` to a specific IP, not `0.0.0.0`
+- [ ] For external access, set `POSTGRES_BIND` to a specific IP and `POSTGRES_ALLOWED_NETWORKS` to the exact CIDRs that need access
 - [ ] Tighten the Docker subnet ranges in `pg_hba.conf` to match your actual network
 - [ ] Schedule regular backups and verify restore works
 - [ ] Review and tune `postgresql.conf` for your workload (connections, memory)
