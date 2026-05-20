@@ -171,27 +171,25 @@ Then restart: `docker compose restart`
 
 ## Connecting other services — Docker vs. external
 
-PostgreSQL listens on all interfaces (`listen_addresses = '*'`), but **authentication rules in `pg_hba.conf` enforce SSL selectively by source address**.  This lets Docker-internal services connect without SSL while requiring SSL for any connection arriving from outside the Docker network.
+PostgreSQL listens on all interfaces (`listen_addresses = '*'`), but **`pg_hba.conf` enforces SSL selectively by source address**.  Docker-internal services connect without SSL; external connections require SSL and must come from a declared network.  Both work simultaneously with no conflict.
 
-```
-# pg_hba.conf evaluation order (first match wins):
-host     ...  172.16.0.0/12  scram-sha-256   ← Docker bridge, no SSL required
-host     ...  10.0.0.0/8     scram-sha-256   ← Docker bridge, no SSL required
-hostssl  ...  0.0.0.0/0      scram-sha-256   ← everything else, SSL required
-```
+At container startup, `docker/entrypoint.sh` inspects the container's own network interfaces and generates two `pg_hba.conf` include files in `/tmp/`:
 
-`hostssl` only matches connections that are actually using SSL — a non-SSL connection from outside the Docker subnets will not match any rule and will be rejected.
+| File | Generated from | Rule type |
+|------|----------------|-----------|
+| `pg_hba_docker.conf` | container's network interfaces (automatic) | `host` — no SSL required |
+| `pg_hba_external.conf` | `POSTGRES_ALLOWED_NETWORKS` in `.env` | `hostssl` — SSL required |
 
 ### Docker services on the same host (shared network)
 
-This is the recommended path for same-host stacks.  The `postgres_net` network is **defined and created by this compose file** — no manual `docker network create` needed.  Other stacks join it as an external network and reach Postgres by the service name `postgres` without SSL.
+No configuration needed beyond joining the network.  The `postgres_net` network is **created by this compose file** — no manual `docker network create` required.  At startup the entrypoint detects the subnet Docker assigned and writes a `host` rule for it automatically.
 
 In the application stack's `docker-compose.yml`:
 
 ```yaml
 networks:
   postgres_net:
-    external: true      # created by the postgres stack, not by this file
+    external: true      # created by the postgres stack, not this file
 
 services:
   app:
@@ -204,47 +202,45 @@ services:
 
 The network name defaults to `postgres_net`.  If you changed `POSTGRES_NETWORK` in `.env`, use that name here instead.
 
-> **Note:** `docker compose down` will attempt to remove `postgres_net`.  If application containers are still attached it will warn and leave the network in place — a useful reminder not to tear down Postgres while apps are running.
+> **Note:** `docker compose down` will attempt to remove `postgres_net`.  If application containers are still attached it will warn and leave the network in place — a useful signal not to tear down Postgres while apps are running.
 
 ### External clients (non-Docker)
 
-External access is controlled by two independent settings that work together:
+Two settings work together for external access.  **Do not list Docker subnets in `POSTGRES_ALLOWED_NETWORKS`** — those are handled automatically.
 
 **1. Which interface to expose** — set `POSTGRES_BIND` in `.env`:
 
 ```bash
-# Specific public IP (recommended):
+# Bind to a specific public IP (recommended):
 POSTGRES_BIND=203.0.113.10
 
-# All interfaces (less precise, but acceptable behind a firewall):
+# Or all interfaces (acceptable behind a firewall):
 POSTGRES_BIND=0.0.0.0
 ```
 
-**2. Which source networks are allowed** — set `POSTGRES_ALLOWED_NETWORKS` in `.env`:
+**2. Which external networks are trusted** — set `POSTGRES_ALLOWED_NETWORKS` in `.env`:
 
 ```bash
 # Single trusted host:
 POSTGRES_ALLOWED_NETWORKS=203.0.113.42/32
 
-# Office + VPN:
+# Office + VPN ranges:
 POSTGRES_ALLOWED_NETWORKS=203.0.113.0/24,198.51.100.128/25
 ```
 
-At container startup, `docker/entrypoint.sh` reads `POSTGRES_ALLOWED_NETWORKS` and generates `hostssl` rules in `/tmp/pg_hba_external.conf`, which `pg_hba.conf` pulls in via `@include_if_exists`.  If the variable is empty or unset, no external connections are permitted — the safe default.
+At startup the entrypoint generates `hostssl` rules from this list.  A connection from an IP not in the list matches no rule and is rejected.  If the variable is empty or unset, the file is not created and all external connections are blocked — the safe default.
 
 To update the allowlist: edit `POSTGRES_ALLOWED_NETWORKS` in `.env` and run `docker compose restart`.
 
-> SSL must also be configured in `config/postgresql.conf` for `hostssl` rules to take effect.
+> SSL must be configured in `config/postgresql.conf` for `hostssl` rules to take effect.
 
-### Both at the same time
+### Summary
 
-The two mechanisms are fully independent and work simultaneously with no conflict:
-
-| Client | Path | SSL |
-|--------|------|-----|
-| Docker container on `postgres_net` | `postgres:5432` (service name) | not required — matched by subnet rule in `pg_hba.conf` |
-| External host / Vault / admin tool | `<host-ip>:5432` (exposed port) | required — matched by generated `hostssl` rule; source must be in `POSTGRES_ALLOWED_NETWORKS` |
-| External host not in allowlist | `<host-ip>:5432` | rejected — no matching rule |
+| Client | Path | SSL enforced |
+|--------|------|-------------|
+| Docker service on `postgres_net` | `postgres:5432` | No — subnet auto-detected, `host` rule |
+| External host in `POSTGRES_ALLOWED_NETWORKS` | `<host-ip>:5432` | Yes — `hostssl` rule |
+| External host **not** in allowlist | `<host-ip>:5432` | Rejected — no matching rule |
 
 ## HashiCorp Vault integration
 
