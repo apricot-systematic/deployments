@@ -1,6 +1,11 @@
 # Runtime secrets — never commit
 .env
 
+# Mounted secret files (superuser credentials, backup encryption keys).
+# Keep the directory in git via .gitkeep, but never the secrets themselves.
+secrets/*
+!secrets/.gitkeep
+
 # SSL certificates and keys — never commit private keys.
 # The CA cert (ca.crt) may be committed for dev environments if all developers
 # need it to verify the server, but is excluded here by default.

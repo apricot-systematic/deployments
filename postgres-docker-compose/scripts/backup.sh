@@ -11,7 +11,8 @@
 #
 # Encryption
 # ----------
-# Set BACKUP_ENCRYPTION_KEY_ID and BACKUP_ENCRYPTION_KEYS in .env to encrypt
+# Set BACKUP_ENCRYPTION_KEY_ID and BACKUP_ENCRYPTION_KEYS in secrets/backup.env
+# (or .env) to encrypt
 # backups with AES-256-CBC (PBKDF2, 600 000 iterations).  The key ID is
 # embedded in the filename so restore.sh can find the right key automatically.
 # Plaintext data is never written to disk — the pipeline is:
@@ -31,6 +32,21 @@ if [[ -f "$PROJECT_DIR/.env" ]]; then
     set +a
 fi
 
+# Backup encryption keys are secrets, so they live in secrets/backup.env rather
+# than .env.  Sourced after .env so it wins; .env is still honored for
+# backward compatibility.
+if [[ -f "$PROJECT_DIR/secrets/backup.env" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$PROJECT_DIR/secrets/backup.env"
+    set +a
+fi
+
+# Superuser name: env wins; otherwise read the mounted secret file; otherwise
+# fall back to the conventional default.
+if [[ -z "${POSTGRES_USER:-}" && -f "$PROJECT_DIR/secrets/db_superuser_username" ]]; then
+    POSTGRES_USER="$(cat "$PROJECT_DIR/secrets/db_superuser_username")"
+fi
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 BACKUP_DIR="$PROJECT_DIR/backups"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"

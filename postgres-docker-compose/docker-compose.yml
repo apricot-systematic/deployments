@@ -8,8 +8,11 @@ services:
     entrypoint: ["bash", "/docker-entrypoint-wrapper.sh"]
     command: postgres -c config_file=/etc/postgresql/postgresql.conf
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Superuser credentials are delivered as mounted docker secrets
+      # (files under ./secrets/), never as plaintext .env values.  Create the
+      # secret files before the first `docker compose up` (see README).
+      POSTGRES_USER_FILE: /run/secrets/db_superuser_username
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
       # PGDATA points inside the volume mount so the mount point itself can be
       # non-empty without confusing the init check.
@@ -20,6 +23,9 @@ services:
       - ./certs:/etc/postgresql/certs
       - ./init:/docker-entrypoint-initdb.d:ro
       - ./docker/entrypoint.sh:/docker-entrypoint-wrapper.sh:ro
+    secrets:
+      - db_superuser_username
+      - db_superuser_password
     ports:
       # IPv4 — defaults to loopback only.  Set POSTGRES_BIND to a public IP
       # (or 0.0.0.0) for external SSL access.
@@ -30,7 +36,7 @@ services:
     networks:
       - postgres_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      test: ["CMD-SHELL", "pg_isready -d ${POSTGRES_DB:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -49,3 +55,9 @@ networks:
 volumes:
   postgres_data:
     driver: local
+
+secrets:
+  db_superuser_username:
+    file: ./secrets/db_superuser_username
+  db_superuser_password:
+    file: ./secrets/db_superuser_password

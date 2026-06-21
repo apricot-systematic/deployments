@@ -25,6 +25,21 @@ if [[ -f "$PROJECT_DIR/.env" ]]; then
     set +a
 fi
 
+# Backup encryption keys are secrets, so they live in secrets/backup.env rather
+# than .env.  Sourced after .env so it wins; .env is still honored for
+# backward compatibility.
+if [[ -f "$PROJECT_DIR/secrets/backup.env" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$PROJECT_DIR/secrets/backup.env"
+    set +a
+fi
+
+# Superuser name: env wins; otherwise read the mounted secret file; otherwise
+# fall back to the conventional default.
+if [[ -z "${POSTGRES_USER:-}" && -f "$PROJECT_DIR/secrets/db_superuser_username" ]]; then
+    POSTGRES_USER="$(cat "$PROJECT_DIR/secrets/db_superuser_username")"
+fi
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 # Must match backup.sh exactly — OpenSSL enc does not store this in the file.
 PBKDF2_ITER=600000

@@ -5,8 +5,14 @@
 # Usage:
 #   ./scripts/create-database.sh <db_name> <role_name> [password]
 #
-# If password is omitted a random one is generated.  The role can connect to
-# <db_name> only — it has no access to other databases.
+# If password is omitted it is taken from the DB_ROLE_PASSWORD environment
+# variable; if that is also unset a random one is generated.  Passing the
+# password via DB_ROLE_PASSWORD keeps it out of the host process list (argv),
+# which is how the Ansible role invokes this script.  The role can connect to
+# <db_name> only -- it has no access to other databases.
+#
+# This script is idempotent: re-running it updates the role password and leaves
+# an existing database in place.
 
 set -euo pipefail
 
@@ -20,6 +26,11 @@ if [[ -f "$PROJECT_DIR/.env" ]]; then
     set +a
 fi
 
+# Superuser name: env wins; otherwise read the mounted secret file; otherwise
+# fall back to the conventional default.
+if [[ -z "${POSTGRES_USER:-}" && -f "$PROJECT_DIR/secrets/db_superuser_username" ]]; then
+    POSTGRES_USER="$(cat "$PROJECT_DIR/secrets/db_superuser_username")"
+fi
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 
 if [[ $# -lt 2 ]]; then
@@ -29,7 +40,8 @@ fi
 
 DB_NAME="$1"
 ROLE_NAME="$2"
-PASSWORD="${3:-$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)}"
+# Precedence: argv[3] > DB_ROLE_PASSWORD env > randomly generated.
+PASSWORD="${3:-${DB_ROLE_PASSWORD:-$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)}}"
 
 # Guard against characters that would break the SQL literal or be bash-expanded.
 if [[ "$PASSWORD" == *"'"* || "$PASSWORD" == *'$'* ]]; then
@@ -60,7 +72,10 @@ BEGIN
     END IF;
 END \$\$;
 
-CREATE DATABASE "${DB_NAME}" OWNER "${ROLE_NAME}";
+-- CREATE DATABASE cannot run inside a transaction or take IF NOT EXISTS, so
+-- guard it with \gexec: build the statement only when the database is absent.
+SELECT format('CREATE DATABASE %I OWNER %I', '${DB_NAME}', '${ROLE_NAME}')
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
 SQL
 
 # Connect to the new database to lock down its schema permissions.
