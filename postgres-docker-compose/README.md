@@ -89,9 +89,16 @@ Data lives in the `postgres_data` Docker named volume — it survives container 
 ./scripts/backup.sh myapp
 ```
 
-Output goes to `./backups/` with a timestamp in the filename (e.g., `myapp_20240115_143000.sql.gz`).
+Output goes to `./backups/`.  The filename encodes what's inside:
+
+| Filename | Encrypted |
+|----------|-----------|
+| `myapp_20240115_143000.sql.gz` | No |
+| `myapp_20240115_143000_enc_key_2024.sql.gz.enc` | Yes — key ID `key_2024` |
 
 ### Restore
+
+The restore script detects encryption automatically from the filename and looks up the correct key — no manual key selection required.
 
 ```bash
 # Restore into a specific database
@@ -99,6 +106,9 @@ Output goes to `./backups/` with a timestamp in the filename (e.g., `myapp_20240
 
 # Restore everything from a pg_dumpall backup
 ./scripts/restore.sh backups/all_20240115_143000.sql.gz
+
+# Encrypted backups work identically — key is found from the filename
+./scripts/restore.sh backups/myapp_20240115_143000_enc_key_2024.sql.gz.enc myapp
 ```
 
 > **Warning:** Restoring into an existing database merges objects.  For a clean restore, drop and recreate the database first:
@@ -107,9 +117,53 @@ Output goes to `./backups/` with a timestamp in the filename (e.g., `myapp_20240
 > CREATE DATABASE myapp OWNER myapp_role;
 > ```
 
+### Backup encryption
+
+Set two variables in `.env` to encrypt all backups before they touch disk:
+
+```bash
+# Which key to use for new backups:
+BACKUP_ENCRYPTION_KEY_ID=key-2025-01
+
+# All keys — current and retired — as comma-separated id:value pairs:
+BACKUP_ENCRYPTION_KEYS=key-2025-01:<base64-key>
+```
+
+Generate a key: `openssl rand -base64 32 | tr -d '\n'`
+
+Encryption uses AES-256-CBC with PBKDF2 key derivation (600 000 iterations).  The pipeline is `pg_dump | gzip | openssl enc > file` — plaintext is never written to disk.  The key is passed to OpenSSL via an environment variable so it does not appear in the process list.
+
+**Key ID rules:** no colons, commas, or whitespace.  Hyphens are fine.  The ID is embedded in the backup filename (`_enc_<keyid>.sql.gz.enc`).
+
+### Key rotation
+
+`BACKUP_ENCRYPTION_KEYS` holds every key the system has ever used.  `BACKUP_ENCRYPTION_KEY_ID` is just a pointer into that list — changing it switches which key is used for new backups.  Old backups remain readable as long as their key stays in the list.
+
+```bash
+# After rotating from key-2024-01 to key-2025-01:
+BACKUP_ENCRYPTION_KEY_ID=key-2025-01
+BACKUP_ENCRYPTION_KEYS=key-2025-01:<new-key>,key-2024-01:<old-key>,key-2023-06:<older-key>
+```
+
+**Rotation procedure:**
+1. Generate a new key: `openssl rand -base64 32 | tr -d '\n'`
+2. Append the new entry to `BACKUP_ENCRYPTION_KEYS`
+3. Update `BACKUP_ENCRYPTION_KEY_ID` to the new key's ID
+4. Done — no keys need to be moved or removed
+
+When restoring, `restore.sh` extracts the key ID from the filename, searches `BACKUP_ENCRYPTION_KEYS` for a matching entry, and decrypts.  If the key is not found it prints exactly what to add to `.env` and exits.
+
+**Retiring old keys:** remove an entry from `BACKUP_ENCRYPTION_KEYS` only when you are certain no remaining backup was encrypted with it.
+
+**Future Vault migration:** the `find_backup_key` logic is isolated in both scripts.  Replacing it with a `vault kv get` call is straightforward — the rest of the backup and restore pipelines are unchanged.
+
 ### Scheduled backups
 
-Run `backup.sh` from cron or a systemd timer on the Docker host.  Rotate old backups with `find backups/ -name '*.sql.gz' -mtime +30 -delete`.
+Run `backup.sh` from cron or a systemd timer on the Docker host.  Rotate old backups with:
+```bash
+find backups/ -name '*.sql.gz' -mtime +30 -delete
+find backups/ -name '*.sql.gz.enc' -mtime +30 -delete
+```
 
 ## SSL / TLS
 
@@ -342,7 +396,9 @@ For environment-specific tuning (memory, connections, WAL settings) add the para
 - [ ] Use a shared Docker network for same-host app access (no port exposure needed)
 - [ ] For external access, set `POSTGRES_BIND` to a specific IP and `POSTGRES_ALLOWED_NETWORKS` to the exact CIDRs that need access
 - [ ] Tighten the Docker subnet ranges in `pg_hba.conf` to match your actual network
-- [ ] Schedule regular backups and verify restore works
+- [ ] Enable backup encryption: set `BACKUP_ENCRYPTION_KEY_ID` and `BACKUP_ENCRYPTION_KEY` in `.env`
+- [ ] Schedule regular backups and verify encrypted restore works end-to-end
+- [ ] Store retired backup keys (`BACKUP_KEY_*`) securely — losing them makes old backups unreadable
 - [ ] Review and tune `postgresql.conf` for your workload (connections, memory)
 - [ ] Set up log shipping or a log aggregator (the container writes to stderr)
 - [ ] If using Vault, rotate the `vault_manager` password after initial setup
