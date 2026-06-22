@@ -20,7 +20,10 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./config:/etc/postgresql:ro
-      - ./certs:/etc/postgresql/certs
+      # Certs mount must NOT nest under the read-only /etc/postgresql mount --
+      # docker cannot create the mountpoint inside a read-only parent.  Mount
+      # read-only at a sibling path; postgres only reads the cert files.
+      - ./certs:/etc/ssl/postgresql:ro
       - ./init:/docker-entrypoint-initdb.d:ro
       - ./docker/entrypoint.sh:/docker-entrypoint-wrapper.sh:ro
     secrets:

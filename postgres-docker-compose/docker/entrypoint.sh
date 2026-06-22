@@ -30,16 +30,47 @@ DOCKER_HBA=/tmp/pg_hba_docker.conf
 EXTERNAL_HBA=/tmp/pg_hba_external.conf
 
 ########################################################################
-# 1. Docker network rules — auto-detected from the kernel routing table.
+# 1. Docker network rules -- allow same-host Docker peers without SSL.
 #
-# "ip route show proto kernel scope link" returns only directly-attached
-# network routes (added automatically by the kernel for each interface).
-# The first field of each line is already the network CIDR — no address
-# arithmetic needed.  Works for both IPv4 and IPv6.
+# Services sharing a Docker network with this container reach Postgres over the
+# bridge by private IP.  pg_hba.conf must list those subnets or the connections
+# are refused, but Docker assigns the subnets dynamically so they are not known
+# ahead of time.  At startup we therefore discover this container's
+# directly-attached subnets and emit a "host" (no-SSL) rule for each -- no
+# manual subnet configuration needed.  External, non-Docker clients are handled
+# separately and require SSL (step 2).
 #
-# Link-local IPv6 (fe80::/64) routes are skipped — they are not useful
-# in pg_hba.conf and vary per interface.
+# Detection prefers iproute2; the stock postgres image lacks it, so we fall
+# back to /proc/net/route.  Link-local IPv6 (fe80::/64) is skipped.
 ########################################################################
+detect_docker_subnets() {
+    # Prefer iproute2 when present (covers IPv4 and IPv6).
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 route show proto kernel scope link 2>/dev/null | awk '{print $1}'
+        ip -6 route show proto kernel scope link 2>/dev/null | awk '$1 !~ /^fe80:/ {print $1}'
+        return 0
+    fi
+
+    # Fallback: the stock postgres image has no iproute2.  Parse IPv4 on-link
+    # routes from /proc/net/route (always present); destination and mask are
+    # stored as little-endian hex.  IPv6 docker auto-detection needs iproute2;
+    # external IPv6 is still handled by POSTGRES_ALLOWED_NETWORKS (hostssl).
+    [[ -r /proc/net/route ]] || return 0
+    local iface dest gw flags refcnt use metric mask mtu window irtt
+    while read -r iface dest gw flags refcnt use metric mask mtu window irtt; do
+        [[ "$iface" == "Iface" ]] && continue   # header row
+        [[ "$gw" != "00000000" ]] && continue    # on-link routes only (no gateway)
+        [[ "$dest" == "00000000" ]] && continue  # skip the default route
+        local o1=$((16#${dest:6:2})) o2=$((16#${dest:4:2}))
+        local o3=$((16#${dest:2:2})) o4=$((16#${dest:0:2}))
+        local m=$((16#$mask)) p=0 i
+        for ((i = 0; i < 32; i++)); do
+            if (( (m >> i) & 1 )); then p=$((p + 1)); fi
+        done
+        echo "${o1}.${o2}.${o3}.${o4}/${p}"
+    done < /proc/net/route
+}
+
 {
     echo "# Docker network rules — auto-detected at startup."
     echo "# Do not edit; regenerated on every container start."
@@ -60,7 +91,9 @@ EXTERNAL_HBA=/tmp/pg_hba_external.conf
 } > "$DOCKER_HBA"
 
 echo "postgres entrypoint: Docker network rules (auto-detected):"
-grep -v '^#' "$DOCKER_HBA" | grep -v '^[[:space:]]*$' | awk '{print "  " $4}'
+# '|| true': grep exits non-zero when there are no rules, which would abort the
+# wrapper under 'set -o pipefail' before postgres ever starts.
+grep -v '^#' "$DOCKER_HBA" | grep -v '^[[:space:]]*$' | awk '{print "  " $4}' || true
 
 ########################################################################
 # 2. External allowlist — from POSTGRES_ALLOWED_NETWORKS.
@@ -81,7 +114,7 @@ if [[ -n "${POSTGRES_ALLOWED_NETWORKS:-}" ]]; then
     } > "$EXTERNAL_HBA"
 
     echo "postgres entrypoint: external SSL access enabled for:"
-    grep -v '^#' "$EXTERNAL_HBA" | grep -v '^[[:space:]]*$' | awk '{print "  " $4}'
+    grep -v '^#' "$EXTERNAL_HBA" | grep -v '^[[:space:]]*$' | awk '{print "  " $4}' || true
 else
     echo "postgres entrypoint: POSTGRES_ALLOWED_NETWORKS not set — external connections disabled."
     rm -f "$EXTERNAL_HBA"

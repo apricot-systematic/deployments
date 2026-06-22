@@ -267,8 +267,8 @@ In `config/postgresql.conf`, uncomment:
 
 ```
 ssl          = on
-ssl_cert_file = '/etc/postgresql/certs/fullchain.pem'
-ssl_key_file  = '/etc/postgresql/certs/privkey.pem'
+ssl_cert_file = '/etc/ssl/postgresql/fullchain.pem'
+ssl_key_file  = '/etc/ssl/postgresql/privkey.pem'
 ```
 
 In `config/pg_hba.conf`, uncomment the `hostssl` line:
