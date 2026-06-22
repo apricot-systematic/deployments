@@ -14,6 +14,8 @@ postgres/
 │   └── pg_ident.conf           # username maps (usually empty)
 ├── certs/                      # SSL certificates (not committed)
 │   └── .gitkeep
+├── secrets/                    # mounted secret files (not committed)
+│   └── .gitkeep                #   db_superuser_username, db_superuser_password, backup.env
 ├── docker/
 │   └── entrypoint.sh           # container entrypoint: generates pg_hba allowlist from env
 ├── init/
@@ -31,9 +33,20 @@ postgres/
 
 ## Quick start
 
+The superuser credentials are delivered as **mounted docker secrets**, so the
+secret files must exist before the first `docker compose up` (compose fails to
+start a service whose `secrets:` source file is missing).
+
 ```bash
-cp .env.example .env
-# Edit .env and set POSTGRES_USER and POSTGRES_PASSWORD
+cp .env.example .env                                   # non-secret config
+
+# Superuser credentials -> mounted secret files (no trailing newline needed;
+# the postgres image strips it):
+mkdir -p secrets
+printf 'postgres' > secrets/db_superuser_username
+openssl rand -base64 24 | tr -d '/+=' | head -c 32 > secrets/db_superuser_password
+chmod 600 secrets/db_superuser_*
+
 docker compose up -d
 ```
 
@@ -41,16 +54,36 @@ The data volume (`postgres_data`) persists across restarts and container recreat
 
 > **Note:** Scripts in `init/` run only once, when the data volume is first initialised.  Editing them after the first `docker compose up` has no effect unless the volume is wiped.
 
+## Secrets
+
+Secrets are **never** stored in `.env`.  They are files under `./secrets/`
+(gitignored), mounted into the container as docker secrets:
+
+| File                            | Purpose                                                        |
+|---------------------------------|---------------------------------------------------------------|
+| `secrets/db_superuser_username` | Superuser name -> `POSTGRES_USER_FILE` (required)             |
+| `secrets/db_superuser_password` | Superuser password -> `POSTGRES_PASSWORD_FILE` (required)    |
+| `secrets/backup.env`            | Backup encryption keys (optional -- see Backup encryption)    |
+
+`POSTGRES_*_FILE` is honored by the postgres image only on **first volume init**;
+it seeds the superuser and is not a password-rotation mechanism.  The helper
+scripts (`backup.sh`, `restore.sh`, `create-database.sh`) read the superuser name
+from `secrets/db_superuser_username` when `POSTGRES_USER` is not set in their
+environment.
+
 ## Environment variables (`.env`)
 
-| Variable           | Default              | Description                                    |
-|--------------------|----------------------|------------------------------------------------|
-| `POSTGRES_VERSION` | `17`                 | PostgreSQL image tag                           |
-| `POSTGRES_USER`    | _(required)_         | Superuser username                             |
-| `POSTGRES_PASSWORD`| _(required)_         | Superuser password                             |
-| `POSTGRES_DB`      | `postgres`           | Default database created at init               |
-| `POSTGRES_BIND`    | `127.0.0.1`          | Host interface to bind the port to             |
-| `POSTGRES_PORT`    | `5432`               | Host port to expose                            |
+`.env` holds non-secret runtime configuration only.
+
+| Variable                    | Default          | Description                                         |
+|-----------------------------|------------------|-----------------------------------------------------|
+| `POSTGRES_VERSION`          | `17`             | PostgreSQL image tag                                |
+| `POSTGRES_DB`               | `postgres`       | Default database created at init                    |
+| `POSTGRES_BIND`             | `127.0.0.1`      | IPv4 host interface to bind the port to             |
+| `POSTGRES_BIND6`            | `::1`            | IPv6 host interface to bind the port to             |
+| `POSTGRES_PORT`             | `5432`           | Host port to expose                                 |
+| `POSTGRES_NETWORK`          | `postgres_net`   | Compose network name (change per instance)          |
+| `POSTGRES_ALLOWED_NETWORKS` | _(empty)_        | External client CIDRs -> hostssl rules (SSL)        |
 
 Set `POSTGRES_BIND=0.0.0.0` to expose the port on all interfaces (e.g., when other hosts must reach this service directly).
 
@@ -69,10 +102,17 @@ This creates:
 
 The generated password is printed once and not stored — save it in your secrets manager.
 
-To use a specific password:
+The script is idempotent: re-running it updates the role's password and leaves an
+existing database in place, so it is safe to run from automation.
+
+To use a specific password, pass it as the third argument, or — to keep it out of
+the process list — via the `DB_ROLE_PASSWORD` environment variable:
 
 ```bash
 ./scripts/create-database.sh myapp myapp_role 'MyStr0ngPassword'
+
+# Or, without exposing the password in argv:
+DB_ROLE_PASSWORD='MyStr0ngPassword' ./scripts/create-database.sh myapp myapp_role
 ```
 
 ## Data persistence and backups
@@ -89,9 +129,16 @@ Data lives in the `postgres_data` Docker named volume — it survives container 
 ./scripts/backup.sh myapp
 ```
 
-Output goes to `./backups/` with a timestamp in the filename (e.g., `myapp_20240115_143000.sql.gz`).
+Output goes to `./backups/`.  The filename encodes what's inside:
+
+| Filename | Encrypted |
+|----------|-----------|
+| `myapp_20240115_143000.sql.gz` | No |
+| `myapp_20240115_143000_enc_key_2024.sql.gz.enc` | Yes — key ID `key_2024` |
 
 ### Restore
+
+The restore script detects encryption automatically from the filename and looks up the correct key — no manual key selection required.
 
 ```bash
 # Restore into a specific database
@@ -99,6 +146,9 @@ Output goes to `./backups/` with a timestamp in the filename (e.g., `myapp_20240
 
 # Restore everything from a pg_dumpall backup
 ./scripts/restore.sh backups/all_20240115_143000.sql.gz
+
+# Encrypted backups work identically — key is found from the filename
+./scripts/restore.sh backups/myapp_20240115_143000_enc_key_2024.sql.gz.enc myapp
 ```
 
 > **Warning:** Restoring into an existing database merges objects.  For a clean restore, drop and recreate the database first:
@@ -107,9 +157,59 @@ Output goes to `./backups/` with a timestamp in the filename (e.g., `myapp_20240
 > CREATE DATABASE myapp OWNER myapp_role;
 > ```
 
+### Backup encryption
+
+The encryption keys are secrets, so they live in `secrets/backup.env` (sourced
+by `backup.sh`/`restore.sh` if present).  Set two variables there to encrypt all
+backups before they touch disk:
+
+```bash
+# secrets/backup.env  (chmod 600)
+# Which key to use for new backups:
+BACKUP_ENCRYPTION_KEY_ID=key-2025-01
+
+# All keys — current and retired — as comma-separated id:value pairs:
+BACKUP_ENCRYPTION_KEYS=key-2025-01:<base64-key>
+```
+
+> For backward compatibility these variables are still honored if set in `.env`,
+> but `secrets/backup.env` is preferred so no secret lives in `.env`.
+
+Generate a key: `openssl rand -base64 32 | tr -d '\n'`
+
+Encryption uses AES-256-CBC with PBKDF2 key derivation (600 000 iterations).  The pipeline is `pg_dump | gzip | openssl enc > file` — plaintext is never written to disk.  The key is passed to OpenSSL via an environment variable so it does not appear in the process list.
+
+**Key ID rules:** no colons, commas, or whitespace.  Hyphens are fine.  The ID is embedded in the backup filename (`_enc_<keyid>.sql.gz.enc`).
+
+### Key rotation
+
+`BACKUP_ENCRYPTION_KEYS` holds every key the system has ever used.  `BACKUP_ENCRYPTION_KEY_ID` is just a pointer into that list — changing it switches which key is used for new backups.  Old backups remain readable as long as their key stays in the list.
+
+```bash
+# secrets/backup.env -- after rotating from key-2024-01 to key-2025-01:
+BACKUP_ENCRYPTION_KEY_ID=key-2025-01
+BACKUP_ENCRYPTION_KEYS=key-2025-01:<new-key>,key-2024-01:<old-key>,key-2023-06:<older-key>
+```
+
+**Rotation procedure:**
+1. Generate a new key: `openssl rand -base64 32 | tr -d '\n'`
+2. Append the new entry to `BACKUP_ENCRYPTION_KEYS`
+3. Update `BACKUP_ENCRYPTION_KEY_ID` to the new key's ID
+4. Done — no keys need to be moved or removed
+
+When restoring, `restore.sh` extracts the key ID from the filename, searches `BACKUP_ENCRYPTION_KEYS` for a matching entry, and decrypts.  If the key is not found it prints exactly what to add to `secrets/backup.env` and exits.
+
+**Retiring old keys:** remove an entry from `BACKUP_ENCRYPTION_KEYS` only when you are certain no remaining backup was encrypted with it.
+
+**Future Vault migration:** the `find_backup_key` logic is isolated in both scripts.  Replacing it with a `vault kv get` call is straightforward — the rest of the backup and restore pipelines are unchanged.
+
 ### Scheduled backups
 
-Run `backup.sh` from cron or a systemd timer on the Docker host.  Rotate old backups with `find backups/ -name '*.sql.gz' -mtime +30 -delete`.
+Run `backup.sh` from cron or a systemd timer on the Docker host.  Rotate old backups with:
+```bash
+find backups/ -name '*.sql.gz' -mtime +30 -delete
+find backups/ -name '*.sql.gz.enc' -mtime +30 -delete
+```
 
 ## SSL / TLS
 
@@ -138,17 +238,27 @@ install -m 600 /etc/letsencrypt/live/db.example.com/privkey.pem   certs/privkey.
 chown 999:999 certs/privkey.pem
 ```
 
-Add a deploy hook so certbot refreshes the copies on renewal:
+Add a deploy hook so certbot refreshes the copies on renewal.  Certbot runs
+every script in `renewal-hooks/deploy/` after **any** renewal and exports
+`RENEWED_LINEAGE` (the live dir of the cert that renewed) — filter on it so an
+unrelated cert's renewal does not bounce this service:
 
 ```bash
 # /etc/letsencrypt/renewal-hooks/deploy/postgres-certs.sh
-#!/bin/bash
-install -m 644 /etc/letsencrypt/live/db.example.com/fullchain.pem \
-    /path/to/postgres/certs/fullchain.pem
-install -m 600 /etc/letsencrypt/live/db.example.com/privkey.pem \
-    /path/to/postgres/certs/privkey.pem
-chown 999:999 /path/to/postgres/certs/privkey.pem
-docker compose -f /path/to/postgres/docker-compose.yml restart
+#!/usr/bin/env bash
+set -euo pipefail
+
+LINEAGE=/etc/letsencrypt/live/db.example.com
+DEST=/path/to/postgres
+
+# When invoked by certbot, act only on this service's own cert.
+if [[ -n "${RENEWED_LINEAGE:-}" && "${RENEWED_LINEAGE%/}" != "$LINEAGE" ]]; then
+    exit 0
+fi
+
+install -m 644 "$LINEAGE/fullchain.pem" "$DEST/certs/fullchain.pem"
+install -m 600 -o 999 -g 999 "$LINEAGE/privkey.pem" "$DEST/certs/privkey.pem"
+docker compose -f "$DEST/docker-compose.yml" restart
 ```
 
 ### Enabling SSL in config
@@ -336,13 +446,15 @@ For environment-specific tuning (memory, connections, WAL settings) add the para
 
 ## Production checklist
 
-- [ ] Set a strong `POSTGRES_PASSWORD` and store it in a secrets manager
+- [ ] Set a strong superuser password in `secrets/db_superuser_password` (mode `0600`) and store a copy in your secrets manager
 - [ ] Enable SSL: deploy certbot certs (`fullchain.pem`, `privkey.pem`) and uncomment ssl lines in `postgresql.conf` and `pg_hba.conf`
 - [ ] Add a certbot deploy hook to refresh `certs/` and restart the container on renewal
 - [ ] Use a shared Docker network for same-host app access (no port exposure needed)
 - [ ] For external access, set `POSTGRES_BIND` to a specific IP and `POSTGRES_ALLOWED_NETWORKS` to the exact CIDRs that need access
 - [ ] Tighten the Docker subnet ranges in `pg_hba.conf` to match your actual network
-- [ ] Schedule regular backups and verify restore works
+- [ ] Enable backup encryption: set `BACKUP_ENCRYPTION_KEY_ID` and `BACKUP_ENCRYPTION_KEYS` in `secrets/backup.env`
+- [ ] Schedule regular backups and verify encrypted restore works end-to-end
+- [ ] Store retired backup keys (`BACKUP_KEY_*`) securely — losing them makes old backups unreadable
 - [ ] Review and tune `postgresql.conf` for your workload (connections, memory)
 - [ ] Set up log shipping or a log aggregator (the container writes to stderr)
 - [ ] If using Vault, rotate the `vault_manager` password after initial setup
