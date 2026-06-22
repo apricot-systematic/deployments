@@ -76,17 +76,10 @@ detect_docker_subnets() {
     echo "# Do not edit; regenerated on every container start."
     printf "# %-8s %-10s %-6s %-40s %s\n" TYPE DATABASE USER ADDRESS METHOD
 
-    # IPv4 directly-attached routes
     while IFS= read -r _net; do
         [[ -z "$_net" ]] && continue
         printf "host      all        all    %-40s scram-sha-256\n" "$_net"
-    done < <(ip -4 route show proto kernel scope link 2>/dev/null | awk '{print $1}')
-
-    # IPv6 directly-attached routes (skip link-local fe80:: prefixes)
-    while IFS= read -r _net; do
-        [[ -z "$_net" ]] && continue
-        printf "host      all        all    %-40s scram-sha-256\n" "$_net"
-    done < <(ip -6 route show proto kernel scope link 2>/dev/null | awk '$1 !~ /^fe80:/ {print $1}')
+    done < <(detect_docker_subnets)
 
 } > "$DOCKER_HBA"
 
